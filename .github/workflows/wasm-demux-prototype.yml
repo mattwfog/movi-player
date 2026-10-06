@@ -1,0 +1,56 @@
+# Prototype for issue #26: how small does movi.wasm get with no software
+# decoders and no libdav1d? Runs the repository's own Docker recipe
+# (docker/Dockerfile + docker/build-ffmpeg.sh) under MOVI_WASM_PROFILE=demux
+# and reports the sizes beside the published full engine. Nothing here is
+# shipped; the artifact is the measurement.
+name: wasm demux prototype
+
+on:
+  push:
+    branches: ["proto/**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build movi.wasm (profile demux)
+        run: |
+          mkdir -p dist
+          docker compose run --rm -e MOVI_WASM_PROFILE=demux build
+
+      - name: Measure
+        id: measure
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq brotli >/dev/null
+          f=dist/wasm-demux/external/movi.wasm
+          test -f "$f"
+          raw=$(stat -c %s "$f"); gz=$(gzip -9 -c "$f" | wc -c); br=$(brotli -c -q 11 "$f" | wc -c)
+          # The published 0.4.1 engine, for the row beside it.
+          npm pack movi-player@0.4.1 --silent >/dev/null
+          tar -xzf movi-player-0.4.1.tgz package/dist/movi.wasm
+          p=package/dist/movi.wasm
+          praw=$(stat -c %s "$p"); pgz=$(gzip -9 -c "$p" | wc -c); pbr=$(brotli -c -q 11 "$p" | wc -c)
+          {
+            echo "## movi.wasm: demux profile against the published 0.4.1 engine"
+            echo
+            echo "| engine | raw | gzip | brotli |"
+            echo "|---|---|---|---|"
+            echo "| 0.4.1 published (full) | $praw | $pgz | $pbr |"
+            echo "| demux (this build) | $raw | $gz | $br |"
+            echo
+            echo "FFmpeg \`--disable-decoders\`, no libdav1d; demuxers, parsers, bitstream filters, swscale and swresample as in the full profile."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: movi-wasm-demux
+          path: |
+            dist/wasm-demux/external/movi.wasm
+            dist/wasm-demux/external/movi.js
+          if-no-files-found: error

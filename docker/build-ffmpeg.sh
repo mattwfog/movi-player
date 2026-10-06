@@ -4,8 +4,25 @@ set -e
 DAV1D_SRC=/opt/dav1d
 DAV1D_PREFIX=/src/dist/dav1d
 
-# Build dav1d for WASM (software AV1 decoder)
-if [ -z "$FORCE_DAV1D" ] && [ -f "${DAV1D_PREFIX}/lib/libdav1d.a" ]; then
+# MOVI_WASM_PROFILE: full (the default, unchanged output) or demux. The demux
+# profile is the prototype for a decoder-less engine (issue #26): FFmpeg's
+# demuxers, parsers and bitstream filters only -- no software decoders, no
+# libdav1d -- for a page where WebCodecs does every decode. swscale and
+# swresample stay because wasm/*.c links them. It builds beside the full
+# profile (its own FFmpeg prefix and output directory) so neither cache is
+# mistaken for the other.
+PROFILE="${MOVI_WASM_PROFILE:-full}"
+case "$PROFILE" in
+    full)  FFMPEG_PREFIX=/src/dist/ffmpeg;       WASM_OUT=/src/dist/wasm ;;
+    demux) FFMPEG_PREFIX=/src/dist/ffmpeg-demux; WASM_OUT=/src/dist/wasm-demux ;;
+    *) echo "unknown MOVI_WASM_PROFILE: $PROFILE (full | demux)"; exit 2 ;;
+esac
+echo "=== profile: $PROFILE (ffmpeg -> $FFMPEG_PREFIX, wasm -> $WASM_OUT) ==="
+
+# Build dav1d for WASM (software AV1 decoder) -- full profile only
+if [ "$PROFILE" != "full" ]; then
+    echo "=== dav1d skipped (profile $PROFILE carries no decoders) ==="
+elif [ -z "$FORCE_DAV1D" ] && [ -f "${DAV1D_PREFIX}/lib/libdav1d.a" ]; then
     echo "=== dav1d library found, skipping build (set FORCE_DAV1D=true to rebuild) ==="
 else
     echo "=== Building dav1d for WASM ==="
@@ -56,8 +73,8 @@ EOF
         "${DAV1D_PREFIX}/lib/pkgconfig/dav1d.pc"
 fi
 
-ls -R /src/dist/ffmpeg/lib || echo "Directory not found"
-if [ -z "$FORCE_FFMPEG" ] && [ -f "/src/dist/ffmpeg/lib/libavformat.a" ]; then
+ls -R ${FFMPEG_PREFIX}/lib || echo "Directory not found"
+if [ -z "$FORCE_FFMPEG" ] && [ -f "${FFMPEG_PREFIX}/lib/libavformat.a" ]; then
     if [ -d "${FFMPEG_SRC}" ]; then
         echo "FFmpeg Source Version:"
         cd ${FFMPEG_SRC} && (git describe --tags --always || echo "Unknown (git describe failed)")
@@ -65,9 +82,26 @@ if [ -z "$FORCE_FFMPEG" ] && [ -f "/src/dist/ffmpeg/lib/libavformat.a" ]; then
     fi
     echo "=== FFmpeg libraries found, skipping build (set FORCE_FFMPEG=true to rebuild) ==="
 else
-    echo "=== Building FFmpeg for WASM (with libdav1d) ==="
-    
+    echo "=== Building FFmpeg for WASM (profile $PROFILE) ==="
+
     cd ${FFMPEG_SRC}
+
+    # What the profile puts in libavcodec. full: every software decoder movi's
+    # software path and thumbnails can use, plus libdav1d. demux: none -- the
+    # parsers and bitstream filters stay (WebCodecs needs the extradata and
+    # the Annex-B / ISOBMFF conversions), the decoders go.
+    if [ "$PROFILE" = "full" ]; then
+        CODEC_FLAGS=(
+            --enable-libdav1d
+            --enable-decoder=h264,hevc,vp9,vp8,libdav1d,vvc,apv,mpeg1video,mpeg2video,mpeg4,h261,h263,h263p,mjpeg,dvvideo,theora,aac,aac_latm,mp3,mp2,mp1,opus,vorbis,flac,ac3,eac3,dca,truehd,mlp,pcm_s16le,pcm_s24le,pcm_s16be,pcm_f32le,pcm_mulaw,pcm_alaw,subrip,ass,ssa,mov_text,pgssub,dvbsub,dvdsub,webvtt,srt
+        )
+        DAV1D_CFLAGS="-I${DAV1D_PREFIX}/include"
+        DAV1D_LDFLAGS="-L${DAV1D_PREFIX}/lib"
+    else
+        CODEC_FLAGS=(--disable-decoders)
+        DAV1D_CFLAGS=""
+        DAV1D_LDFLAGS=""
+    fi
     
     # Clean previous build
     make clean 2>/dev/null || true
@@ -90,7 +124,7 @@ else
     PKG_CONFIG_PATH="${DAV1D_PREFIX}/lib/pkgconfig" \
     emconfigure ./configure \
         --pkg-config=pkg-config \
-        --prefix=/src/dist/ffmpeg \
+        --prefix=${FFMPEG_PREFIX} \
         --target-os=none \
         --arch=x86_32 \
         --cc=emcc \
@@ -111,15 +145,14 @@ else
         --enable-avutil \
         --enable-swresample \
         --enable-swscale \
-        --enable-libdav1d \
+        "${CODEC_FLAGS[@]}" \
         --enable-protocol=file \
         --enable-demuxer=mov,mp4,m4a,mj2,avi,flv,matroska,webm,asf,mpegts,mpegps,mpegvideo,flac,ogg,wav,srt,ass,ssa,webvtt,iamf,apv,h264,hevc,h261,h263,av1,vvc,aac,ac3,eac3,mp3,obu,ivf,mjpeg,dv \
-        --enable-decoder=h264,hevc,vp9,vp8,libdav1d,vvc,apv,mpeg1video,mpeg2video,mpeg4,h261,h263,h263p,mjpeg,dvvideo,theora,aac,aac_latm,mp3,mp2,mp1,opus,vorbis,flac,ac3,eac3,dca,truehd,mlp,pcm_s16le,pcm_s24le,pcm_s16be,pcm_f32le,pcm_mulaw,pcm_alaw,subrip,ass,ssa,mov_text,pgssub,dvbsub,dvdsub,webvtt,srt \
         --enable-parser=h264,hevc,vp8,vp9,av1,vvc,apv,lcevc,mpeg4video,mpegvideo,h261,h263,mjpeg,aac,mp3,opus,vorbis,flac,hdmv_pgs_subtitle \
         --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,vvc_mp4toannexb,vvc_metadata,av1_metadata,av1_frame_merge,av1_frame_split,lcevc_metadata,pgs_frame_merge,iso_media_metadata_manipulator,extract_extradata,vp9_superframe \
-        --extra-cflags="-Oz -flto -s USE_PTHREADS=0 -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 -I${DAV1D_PREFIX}/include" \
-        --extra-cxxflags="-Oz -flto -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 -I${DAV1D_PREFIX}/include" \
-        --extra-ldflags="-s WASM=1 -s USE_ZLIB=1 -Oz -flto -L${DAV1D_PREFIX}/lib"
+        --extra-cflags="-Oz -flto -s USE_PTHREADS=0 -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 ${DAV1D_CFLAGS}" \
+        --extra-cxxflags="-Oz -flto -s USE_ZLIB=1 -D_FILE_OFFSET_BITS=64 ${DAV1D_CFLAGS}" \
+        --extra-ldflags="-s WASM=1 -s USE_ZLIB=1 -Oz -flto ${DAV1D_LDFLAGS}"
 
     echo "=== Compiling FFmpeg ==="
     emmake make -j$(nproc)
@@ -132,7 +165,7 @@ echo "=== Building movi WASM module ==="
 cd /src
 
 # Create output directory
-mkdir -p /src/dist/wasm
+mkdir -p ${WASM_OUT}
 
 # Build the movi WASM module with Asyncify for async I/O
 # Uses custom AVIO with JavaScript callbacks instead of WORKERFS
@@ -160,10 +193,12 @@ rm -rf "$OBJDIR"
 mkdir -p "$OBJDIR"
 
 C_COMMON_FLAGS=(
-    -I/src/dist/ffmpeg/include
-    -I${DAV1D_PREFIX}/include
+    -I${FFMPEG_PREFIX}/include
     -Oz -flto -D_FILE_OFFSET_BITS=64
 )
+if [ "$PROFILE" = "full" ]; then
+    C_COMMON_FLAGS+=(-I${DAV1D_PREFIX}/include)
+fi
 CXX_COMMON_FLAGS=(
     -I/src/wasm/signalsmith/signalsmith-stretch/include
     -I/src/wasm/signalsmith/signalsmith-linear/include
@@ -185,10 +220,13 @@ done
 #   movi-slim.js  no SINGLE_FILE — emits movi-slim.js + movi-slim.wasm, so the
 #                 WASM streams+compiles as a separate cached asset (the opt-in
 #                 "slim" build; consumers host the extra .wasm).
+if [ "$PROFILE" = "full" ]; then
+    LINK_LIBS=(-L${FFMPEG_PREFIX}/lib -L${DAV1D_PREFIX}/lib -lavformat -lavcodec -ldav1d -lavutil -lswresample -lswscale)
+else
+    LINK_LIBS=(-L${FFMPEG_PREFIX}/lib -lavformat -lavcodec -lavutil -lswresample -lswscale)
+fi
 LINK_FLAGS=(
-    -L/src/dist/ffmpeg/lib
-    -L${DAV1D_PREFIX}/lib
-    -lavformat -lavcodec -ldav1d -lavutil -lswresample -lswscale
+    "${LINK_LIBS[@]}"
     -Oz
     -flto
     -fno-exceptions
@@ -228,7 +266,7 @@ LINK_FLAGS=(
 # Default build — WASM embedded (SINGLE_FILE). Unchanged output.
 em++ "$OBJDIR"/*.o "${LINK_FLAGS[@]}" \
     -s SINGLE_FILE=1 \
-    -o /src/dist/wasm/movi.js
+    -o ${WASM_OUT}/movi.js
 
 # External-WASM build — identical binary, just shipped as a standalone
 # movi.wasm alongside its glue instead of embedded. The WASM itself is NOT
@@ -237,9 +275,9 @@ em++ "$OBJDIR"/*.o "${LINK_FLAGS[@]}" \
 # .wasm name from the -o basename, so this emits external/movi.js +
 # external/movi.wasm. The subdir keeps `movi.js` from colliding with the
 # embedded SINGLE_FILE glue above.
-mkdir -p /src/dist/wasm/external
+mkdir -p ${WASM_OUT}/external
 em++ "$OBJDIR"/*.o "${LINK_FLAGS[@]}" \
-    -o /src/dist/wasm/external/movi.js
+    -o ${WASM_OUT}/external/movi.js
 
-echo "=== Build complete ==="
-ls -la /src/dist/wasm/
+echo "=== Build complete (profile $PROFILE) ==="
+ls -la ${WASM_OUT}/ ${WASM_OUT}/external/
